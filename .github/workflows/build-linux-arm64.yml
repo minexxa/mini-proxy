@@ -19,7 +19,7 @@ jobs:
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
-        # Host is already aarch64-unknown-linux-gnu, no extra target needed
+        # Host is already aarch64-unknown-linux-gnu
 
       - name: Install nightly + rust-src (for eBPF)
         uses: dtolnay/rust-toolchain@nightly
@@ -37,19 +37,25 @@ jobs:
             mini-ebpf
             mini-proxy
 
-      # bpf-linker must match the nightly's LLVM.
-      # On Ubuntu 24.04 arm64 we install the system LLVM packages first.
-      - name: Install bpf-linker dependencies
+      # Ubuntu 24.04 has no unversioned libpolly-dev.
+      # Install the common set; polly is optional for many bpf-linker builds.
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm-dev libpolly-dev
+          sudo apt-get install -y clang lld llvm-dev
+          # Best-effort versioned polly (ignore if missing)
+          sudo apt-get install -y libpolly-19-dev || \
+          sudo apt-get install -y libpolly-18-dev || \
+          sudo apt-get install -y libpolly-17-dev || true
           echo "LLVM_CONFIG_PATH=$(which llvm-config || true)" >> $GITHUB_ENV
           llvm-config --version || true
-          rustc +nightly -vV | grep -E 'llvm|host'
+          rustc +nightly -vV | grep -E 'llvm|host' || true
 
       - name: Install bpf-linker
         run: |
-          # Prefer a version that can talk to current nightly LLVM
+          # Prefer a version that can talk to current nightly LLVM.
+          # If system LLVM is too old, bpf-linker may still build against
+          # the one bundled with nightly via llvm-tools.
           cargo +nightly install bpf-linker --locked 2>/dev/null || \
           cargo +nightly install bpf-linker
 
