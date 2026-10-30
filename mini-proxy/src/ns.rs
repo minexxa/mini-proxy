@@ -57,13 +57,15 @@ pub fn create_daens() -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("unshare thread panicked"))??;
 
-    // Receive the fd.
+    // Receive the fd. The control buffer MUST be allocated: passing None
+    // gives msg_control = NULL and SCM_RIGHTS is truncated away (ENOBUFS).
     let mut buf = [0u8; 8];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let mut cmsg_buf = [0u8; 64];
     let msg = recvmsg::<UnixAddr>(
         a,
         &mut iov,
-        None,
+        Some(&mut cmsg_buf),
         MsgFlags::from_bits_truncate(MSG_CMSG_CLOEXEC),
     )
     .context("recvmsg scm_rights")?;
