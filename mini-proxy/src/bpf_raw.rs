@@ -5,11 +5,14 @@ use anyhow::Result;
 use std::os::fd::{AsRawFd, RawFd};
 
 const BPF_MAP_UPDATE_ELEM: i64 = 2;
-const BPF_SK_STORAGE_GET_F_CREATE: u64 = 1;
 
-/// Kernel contract for BPF_MAP_TYPE_SK_STORAGE updates: `key` points to an
-/// int holding the map's value_size, and the target socket fd rides in the
-/// upper 32 bits of `flags`.
+/// Kernel contract for BPF_MAP_TYPE_SK_STORAGE updates
+/// (net/core/bpf_sk_storage.c: bpf_fd_sk_storage_update_elem):
+/// `key` points to an int holding the target socket fd, `value` points to a
+/// buffer of the map's value_size, and `flags` takes plain map flags —
+/// BPF_ANY (0) creates the storage or overwrites it. The program-side
+/// BPF_SK_STORAGE_GET_F_CREATE flag is NOT valid in this path; the kernel
+/// rejects any flags > BPF_EXIST with EINVAL.
 pub fn mark_control_socket(sk_storage_map_fd: RawFd, sock_fd: RawFd) -> Result<()> {
     #[repr(C)]
     struct Attr {
@@ -19,14 +22,14 @@ pub fn mark_control_socket(sk_storage_map_fd: RawFd, sock_fd: RawFd) -> Result<(
         value: u64,
         flags: u64,
     }
-    let value_size: i32 = 4; // SK_IDENTITY stores u32
-    let value: u32 = 1;
+    let key: i32 = sock_fd;
+    let value: u32 = 1; // SK_IDENTITY stores u32
     let attr = Attr {
         map_fd: sk_storage_map_fd as u32,
         pad: 0,
-        key: &value_size as *const i32 as u64,
+        key: &key as *const i32 as u64,
         value: &value as *const u32 as u64,
-        flags: ((sock_fd as u64) << 32) | BPF_SK_STORAGE_GET_F_CREATE,
+        flags: 0, // BPF_ANY
     };
     let rc = unsafe {
         libc::syscall(
