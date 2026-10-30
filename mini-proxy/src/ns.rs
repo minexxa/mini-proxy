@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use libc::{CLONE_NEWNET, MSG_CMSG_CLOEXEC};
 use nix::sys::socket::{
-    recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, SockProtocol, UnixAddr,
+    ControlMessage, ControlMessageOwned, MsgFlags, SockProtocol, UnixAddr, recvmsg, sendmsg,
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
@@ -108,7 +108,10 @@ fn bind_mount_netns() -> Result<()> {
         )
     };
     if rc != 0 {
-        anyhow::bail!("bind mount netns failed: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "bind mount netns failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
     Ok(())
 }
@@ -163,4 +166,21 @@ pub fn run_ip_netns(args: &[&str]) -> Result<()> {
     let mut full: Vec<&str> = vec!["ip", "-n", NETNS_NAME];
     full.extend_from_slice(args);
     run_cmd(&full)
+}
+
+/// Best-effort teardown on exit: detach TC clsact from the captured
+/// interfaces (netlink-attached filters survive the process), delete the
+/// veth bridge and the proxy namespace. Errors are logged, not fatal.
+pub fn cleanup(lan: Option<&str>, wan: Option<&str>, proxy_link: &str) {
+    for ifc in [lan, wan, Some(proxy_link)].into_iter().flatten() {
+        if let Err(e) = run_cmd(&["tc", "qdisc", "del", "dev", ifc, "clsact"]) {
+            tracing::debug!("cleanup tc {ifc}: {e:#}");
+        }
+    }
+    if let Err(e) = run_cmd(&["ip", "link", "del", proxy_link]) {
+        tracing::debug!("cleanup link {proxy_link}: {e:#}");
+    }
+    if let Err(e) = run_cmd(&["ip", "netns", "del", NETNS_NAME]) {
+        tracing::debug!("cleanup netns: {e:#}");
+    }
 }

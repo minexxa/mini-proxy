@@ -17,6 +17,11 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 aya = "0.13"
 aya-obj = "0.2"
+bytes = "1"
+rand = "0.8"
+quinn = { version = "0.11.7", default-features = false, features = ["log", "runtime-tokio", "rustls", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
 
 [features]
 # Compiles in the eBPF object built from ../mini-ebpf.

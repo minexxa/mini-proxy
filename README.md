@@ -3,7 +3,7 @@
 A minimal transparent proxy built on the honk/dae kernel datapath design:
 eBPF steers traffic in the kernel, **direct traffic never reaches
 userspace** — only flows the kernel verdicts as "proxy" enter this process,
-which relays them to a SOCKS5 server.
+which relays them to the configured outbound (SOCKS5 or Hysteria2).
 
 Reuses honk's architecture (veth-pair proxy netns, TC hooks, sk_lookup,
 DNS-derived per-IP domain routing) with a drastically trimmed map surface
@@ -14,7 +14,7 @@ DNS-derived per-IP domain routing) with a drastically trimmed map surface
 ```
 mini-ebpf-common/   shared kernel<->userspace ABI (no_std)
 mini-ebpf/          eBPF programs (aya-ebpf, standalone crate)
-mini-proxy/         userspace: loader, netns, listeners, SOCKS5, DNS engine
+mini-proxy/         userspace: loader, netns, listeners, outbounds (SOCKS5/Hysteria2), DNS engine
 ```
 
 ### eBPF programs (4 + sk_lookup)
@@ -55,16 +55,42 @@ domain — dae's trick, simplified.
 
 ### Loop prevention
 
-Every outbound control-plane socket (SOCKS5 dial, DNS upstream) is marked
-with `SO_MARK` (visible as `skb->mark`) *and* carries an sk_storage flag;
-`wan_egress` passes sockets carrying either.
+Every outbound control-plane socket (SOCKS5 dial, Hysteria2 QUIC endpoint,
+DNS upstream) is marked with `SO_MARK` (visible as `skb->mark`) *and*
+carries an sk_storage flag; `wan_egress` passes sockets carrying either.
+
+## Outbounds
+
+`general.outbound` selects the protocol:
+
+- `socks5` — `[socks5]` section: server, optional user/pass auth.
+- `hysteria2` — `[hysteria2]` section: server (`host:port`), password,
+  sni, insecure, and optional `up`/`down` bandwidth. Implemented over QUIC
+  (quinn) with raw HTTP/3 auth, sing-box-matching windows, BBR congestion
+  control (Brutal-like initial window when `up` is set); TCP via QUIC
+  streams, UDP via QUIC datagrams with fragmentation/reassembly. The
+  server hostname is resolved before the eBPF hooks attach, so lookups
+  never loop through the datapath.
+
+## Shutdown & cleanup
+
+SIGINT/SIGTERM trigger an orderly teardown: the netlink-attached TC
+filters (`tc qdisc del ... clsact`), the `dae0` veth bridge and the
+`mini-proxy-daens` namespace are all removed — they outlive the process
+otherwise. The same cleanup runs if a relay loop dies.
+
+## Rulesets
+
+Rules can be imported from text files with `kind = "list"`: one entry per
+line (CIDR or domain suffix), `#` comments allowed, `+.` prefixes
+stripped. Each entry inherits the importing rule's verdict.
 
 ## Requirements
 
 - Linux ≥ 6.6 (TCX/SchedClassifier attach; developed against honk's 6.12+ target)
 - root privileges (TC, sk_lookup, netns, IP_TRANSPARENT)
-- `iproute2` (`ip`, `tc`), and a SOCKS5 server that supports CONNECT +
-  UDP ASSOCIATE
+- `iproute2` (`ip`, `tc`), and an outbound server (SOCKS5 with CONNECT +
+  UDP ASSOCIATE, or a Hysteria2 server)
 
 ## Build
 
@@ -98,15 +124,16 @@ system LLVM for the chosen feature.
 sudo ./target/release/mini-proxy --config config.example.toml
 ```
 
-Rules live in the TOML config (see `config.example.toml`): CIDR, port, and
-domain-suffix rules with `direct`/`proxy`/`block` verdicts.
+Rules live in the TOML config (see `config.example.toml`): CIDR, port,
+domain-suffix, and ruleset-file (`list`) rules with
+`direct`/`proxy`/`block` verdicts.
 
 ## What's intentionally missing (vs honk)
 
 - No geoip/geosite databases, no logic/parameter expressions
-- TCP only via SOCKS5 CONNECT; UDP via UDP ASSOCIATE (no QUIC-side tricks)
+- TCP/UDP via SOCKS5 or Hysteria2 only (no Salamander/Gecko obfuscation)
 - Only plain UDP/53 DNS hijack (no DoH/DoT interception)
-- Single SOCKS5 outbound, single DNS upstream
+- Single outbound, single DNS upstream
 - No fragment reassembly routing (fragments fall through to
   address/port-less surfaces like dae)
 

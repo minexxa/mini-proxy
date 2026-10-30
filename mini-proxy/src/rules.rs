@@ -5,10 +5,9 @@
 //! and the resulting verdict is published into DOMAIN_ROUTE — the dae/dae
 //! trick that lets the kernel route by domain without ever parsing DNS.
 
-use crate::config::Config;
+use anyhow::{Context, Result};
 use aya::maps::lpm_trie::Key;
 use aya::maps::{HashMap, MapData};
-use anyhow::{Context, Result};
 use mini_ebpf_common::{DomainRouteEntry, VERDICT_BLOCK, VERDICT_DIRECT, VERDICT_PROXY};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -47,9 +46,9 @@ pub struct Rules {
 }
 
 impl Rules {
-    pub fn new(config: &Config) -> Result<Rules> {
+    pub fn new(default_verdict: &str, rules: &[crate::config::Rule]) -> Result<Rules> {
         let mut domain_rules = Vec::new();
-        for rule in &config.rules {
+        for rule in rules {
             let verdict = Verdict::parse(&rule.verdict)?;
             match rule.kind.as_str() {
                 "domain" => domain_rules.push((split_domain(&rule.value), verdict)),
@@ -58,7 +57,7 @@ impl Rules {
             }
         }
         Ok(Rules {
-            default: Verdict::parse(&config.general.default_verdict)?,
+            default: Verdict::parse(default_verdict)?,
             domain_rules,
         })
     }
@@ -98,8 +97,8 @@ pub struct StaticMaps {
 }
 
 impl StaticMaps {
-    pub fn populate_cidr_ports(&mut self, config: &Config) -> Result<()> {
-        for rule in &config.rules {
+    pub fn populate_cidr_ports(&mut self, rules: &[crate::config::Rule]) -> Result<()> {
+        for rule in rules {
             let verdict = Verdict::parse(&rule.verdict)?.to_u8();
             match rule.kind.as_str() {
                 "cidr" => self.insert_cidr(&rule.value, verdict)?,

@@ -1,17 +1,17 @@
 //! Transparent relay: consumes the `daens` listeners.
 //!
 //! TCP: accepted conns carry the original destination (IP_TRANSPARENT +
-//! sk_lookup assignment); relay to the SOCKS5 server over a pre-marked
-//! dial socket (CONNECT), copying both directions.
+//! sk_lookup assignment); relay to the outbound (SOCKS5 / Hysteria2) over a
+//! control-plane marked dial socket, copying both directions.
 //!
 //! UDP: each datagram carries its original destination via IP_RECVORIGDSTADDR.
-//! Flows to port 53 are handed to the DNS engine; other flows use SOCKS5
-//! UDP ASSOCIATE. Replies are sent from a per-flow socket bound to the
+//! Flows to port 53 are handed to the DNS engine; other flows go through the
+//! outbound's UDP relay. Replies are sent from a per-flow socket bound to the
 //! original destination inside `daens`, so the datapath's dae0_ingress
 //! restores the captured framing and hands them back to the client.
 
 use crate::listener::{create_reply_socket, orig_dst_tcp};
-use crate::socks5::Socks5Client;
+use crate::outbound::{BoxStream, Outbound, UdpUpstream};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 
-pub async fn run_tcp(listener: tokio::net::TcpListener, socks: Arc<Socks5Client>) -> Result<()> {
+pub async fn run_tcp(listener: tokio::net::TcpListener, outbound: Arc<Outbound>) -> Result<()> {
     loop {
         let (conn, _client) = match listener.accept().await {
             Ok(x) => x,
@@ -29,20 +29,20 @@ pub async fn run_tcp(listener: tokio::net::TcpListener, socks: Arc<Socks5Client>
                 continue;
             }
         };
-        let socks = socks.clone();
+        let outbound = outbound.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp(conn, socks).await {
+            if let Err(e) = handle_tcp(conn, outbound).await {
                 tracing::debug!(error = %e, "tcp flow ended");
             }
         });
     }
 }
 
-async fn handle_tcp(conn: TcpStream, socks: Arc<Socks5Client>) -> Result<()> {
+async fn handle_tcp(conn: TcpStream, outbound: Arc<Outbound>) -> Result<()> {
     let orig = orig_dst_tcp(&conn)?;
-    let mut upstream = socks.connect_tcp(orig).await?;
+    let upstream: BoxStream = outbound.connect_tcp(orig).await?;
     let (mut cr, mut cw) = conn.into_split();
-    let (mut ur, mut uw) = upstream.split();
+    let (mut ur, mut uw) = tokio::io::split(upstream);
     let c2u = tokio::io::copy(&mut cr, &mut uw);
     let u2c = tokio::io::copy(&mut ur, &mut cw);
     tokio::select! {
@@ -53,10 +53,8 @@ async fn handle_tcp(conn: TcpStream, socks: Arc<Socks5Client>) -> Result<()> {
 }
 
 struct UdpFlow {
-    /// SOCKS5 relay endpoint socket (control-plane marked, host ns).
-    socks_udp: UdpSocket,
-    /// ASSOCIATE control connection; dropped with the flow.
-    _control: TcpStream,
+    /// Outbound UDP relay channel.
+    upstream: UdpUpstream,
     /// Reply socket bound to the original destination inside `daens`.
     reply: UdpSocket,
     client: SocketAddr,
@@ -64,7 +62,7 @@ struct UdpFlow {
 
 pub async fn run_udp(
     sock: std::net::UdpSocket,
-    socks: Arc<Socks5Client>,
+    outbound: Arc<Outbound>,
     dns: Arc<crate::dns::DnsEngine>,
     maps: Arc<Mutex<crate::rules::StaticMaps>>,
 ) -> Result<()> {
@@ -124,7 +122,7 @@ pub async fn run_udp(
             if let Some(f) = table.get(&key) {
                 f.clone()
             } else {
-                let flow = match create_udp_flow(&socks, key).await {
+                let flow = match create_udp_flow(&outbound, key).await {
                     Ok(f) => Arc::new(f),
                     Err(e) => {
                         tracing::warn!(error = %e, "udp flow setup");
@@ -147,11 +145,8 @@ pub async fn run_udp(
             }
         };
 
-        // Wrap in the SOCKS5 UDP request header and forward.
-        let mut pkt = vec![0u8, 0, 0];
-        push_udp_addr(&mut pkt, orig);
-        pkt.extend_from_slice(&payload);
-        if let Err(e) = flow.socks_udp.send(&pkt).await {
+        // Forward through the outbound relay channel.
+        if let Err(e) = flow.upstream.send(&payload, orig).await {
             tracing::warn!(error = %e, "udp upstream send");
         }
     }
@@ -159,15 +154,14 @@ pub async fn run_udp(
 }
 
 async fn create_udp_flow(
-    socks: &Arc<Socks5Client>,
+    outbound: &Arc<Outbound>,
     key: (SocketAddr, SocketAddr),
 ) -> Result<UdpFlow> {
-    let (client, orig) = key;
-    let (control, socks_udp) = socks.associate_udp().await?;
-    let reply = create_reply_socket(orig)?;
+    let (client, _orig) = key;
+    let upstream = outbound.udp_session().await?;
+    let reply = create_reply_socket(_orig)?;
     Ok(UdpFlow {
-        socks_udp,
-        _control: control,
+        upstream,
         reply,
         client,
     })
@@ -178,59 +172,13 @@ async fn pump_udp_replies(flow: Arc<UdpFlow>) -> Result<()> {
     loop {
         let n = tokio::time::timeout(
             std::time::Duration::from_secs(300),
-            flow.socks_udp.recv(&mut buf),
+            flow.upstream.recv(&mut buf),
         )
         .await??;
-        if n < 4 {
-            continue;
-        }
-        let (payload, _remote) = parse_udp_header(&buf[..n])?;
         // Emit from the original-destination socket: src = orig, dst = client,
         // routed out of daens via dae0peer and restored by dae0_ingress.
-        flow.reply.send_to(payload, flow.client).await?;
+        flow.reply.send_to(&buf[..n], flow.client).await?;
     }
-}
-
-fn push_udp_addr(buf: &mut Vec<u8>, addr: SocketAddr) {
-    match addr {
-        SocketAddr::V4(a) => {
-            buf.push(1);
-            buf.extend_from_slice(&a.ip().octets());
-            buf.extend_from_slice(&a.port().to_be_bytes());
-        }
-        SocketAddr::V6(a) => {
-            buf.push(4);
-            buf.extend_from_slice(&a.ip().octets());
-            buf.extend_from_slice(&a.port().to_be_bytes());
-        }
-    }
-}
-
-fn parse_udp_header(msg: &[u8]) -> Result<(&[u8], SocketAddr)> {
-    if msg.len() < 4 {
-        anyhow::bail!("short UDP relay packet");
-    }
-    let atyp = msg[3];
-    let (addr, hdr_len) = match atyp {
-        1 => {
-            if msg.len() < 10 {
-                anyhow::bail!("short v4 UDP header");
-            }
-            let ip = std::net::Ipv4Addr::new(msg[4], msg[5], msg[6], msg[7]);
-            let port = u16::from_be_bytes([msg[8], msg[9]]);
-            (SocketAddr::new(ip.into(), port), 10)
-        }
-        4 => {
-            if msg.len() < 22 {
-                anyhow::bail!("short v6 UDP header");
-            }
-            let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&msg[4..20]).unwrap());
-            let port = u16::from_be_bytes([msg[20], msg[21]]);
-            (SocketAddr::new(ip.into(), port), 22)
-        }
-        other => anyhow::bail!("UDP relay ATYP {other}"),
-    };
-    Ok((&msg[hdr_len..], addr))
 }
 
 struct UdpEvent {

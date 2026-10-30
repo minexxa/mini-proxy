@@ -18,12 +18,33 @@ wan_interface = "auto"
 # Verdict when no rule matches: "direct" | "proxy" | "block".
 default_verdict = "proxy"
 
+# Outbound protocol: "socks5" | "hysteria2".
+outbound = "socks5"
+
 [socks5]
 # Upstream SOCKS5 server that receives all proxied flows.
+# Only used when general.outbound = "socks5".
 server = "127.0.0.1:1080"
 # Optional username/password auth (RFC 1929).
 username = ""
 password = ""
+
+[hysteria2]
+# Hysteria2 server "host:port" or "ip:port" (hostname resolved via system
+# DNS at startup, before the eBPF hooks are attached).
+# Only used when general.outbound = "hysteria2".
+server = "example.com:443"
+# Auth credential (the server's auth password).
+password = ""
+# TLS SNI; defaults to the server host.
+sni = ""
+# Skip server certificate verification (self-signed servers).
+insecure = false
+# Local bandwidth limits ("100 Mbps", "80", empty = auto/congestion control).
+# up is our upload (Brutal-style pacing); down is advertised to the server
+# via Hysteria-CC-RX.
+up = ""
+down = ""
 
 [dns]
 # Upstream resolver queried directly (bypasses the datapath via the
@@ -34,6 +55,11 @@ upstream = "223.5.5.5:53"
 #   kind = "cidr"   value = "10.0.0.0/8"      verdict = direct|proxy|block
 #   kind = "port"   value = "443"             verdict = direct|proxy|block
 #   kind = "domain" value = "example.com"     verdict = direct|proxy|block
+#   kind = "list"   value = "/etc/mini-proxy/direct.list"  verdict = direct
+# A "list" rule imports a ruleset file: one entry per line, either a CIDR
+# (contains '/') or a domain suffix; blank lines and '#' comments are
+# skipped, a "+." prefix is stripped. Every entry inherits the rule's
+# verdict and is spliced in at the list rule's position.
 # Domain rules are suffix matches (labels); "cn" matches any *.cn. The
 # verdict is applied to every IP the domain resolves to, so domain routing
 # works for the subsequent data packets without eBPF ever parsing DNS.
@@ -61,3 +87,9 @@ verdict = "proxy"
 kind = "port"
 value = "25"
 verdict = "block"
+
+# Ruleset file import example:
+# [[rules]]
+# kind = "list"
+# value = "/etc/mini-proxy/proxy.list"
+# verdict = "proxy"
