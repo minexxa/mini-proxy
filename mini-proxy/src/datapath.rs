@@ -142,10 +142,11 @@ pub fn setup_links(config: &Config) -> Result<()> {
 
     // Control-plane replies leave daens via dae0peer. Addresses are /32, so
     // the gateway is not in any subnet: `onlink` accepts it, and the static
-    // neighbor entry below makes it resolvable without ARP.
+    // neighbor entry below makes it resolvable without ARP. `replace` keeps
+    // restarts idempotent.
     run_ip_netns(&[
         "route",
-        "add",
+        "replace",
         "default",
         "via",
         "169.254.0.1",
@@ -156,7 +157,7 @@ pub fn setup_links(config: &Config) -> Result<()> {
     let _ = run_ip_netns(&[
         "-6",
         "route",
-        "add",
+        "replace",
         "default",
         "via",
         DAE0_V6_GW,
@@ -178,9 +179,21 @@ pub fn setup_links(config: &Config) -> Result<()> {
 
     // Marked packets deliver to local transparent sockets. A "local default"
     // route must sit on a device — use lo, which is up at this point.
+    // `replace` keeps restarts against a stale netns idempotent.
     let mark = tproxy_mark(config);
+    let _ = run_ip_netns(&["rule", "del", "fwmark", &format!("{mark:#x}"), "table", "100"]);
     run_ip_netns(&["rule", "add", "fwmark", &format!("{mark:#x}"), "table", "100"])?;
-    run_ip_netns(&["route", "add", "local", "default", "dev", "lo", "table", "100"])?;
+    run_ip_netns(&[
+        "route",
+        "replace",
+        "local",
+        "default",
+        "dev",
+        "lo",
+        "table",
+        "100",
+    ])?;
+    let _ = run_ip_netns(&["-6", "rule", "del", "fwmark", &format!("{mark:#x}"), "table", "100"]);
     let _ = run_ip_netns(&[
         "-6",
         "rule",
@@ -190,7 +203,17 @@ pub fn setup_links(config: &Config) -> Result<()> {
         "table",
         "100",
     ]);
-    let _ = run_ip_netns(&["-6", "route", "add", "local", "default", "dev", "lo", "table", "100"]);
+    let _ = run_ip_netns(&[
+        "-6",
+        "route",
+        "replace",
+        "local",
+        "default",
+        "dev",
+        "lo",
+        "table",
+        "100",
+    ]);
     Ok(())
 }
 
@@ -243,6 +266,9 @@ pub fn load_and_attach(
 
     let mut ebpf = aya::EbpfLoader::new()
         .set_global("PARAM", &param, true)
+        // SK_IDENTITY (sk_storage) has no aya 0.13 wrapper; we only need its
+        // fd for raw bpf() syscalls, which Map::Unsupported still provides.
+        .allow_unsupported_maps()
         .load(include_bytes_aligned!(
             "../../mini-ebpf/target/bpfel-unknown-none/release/mini-ebpf"
         ))

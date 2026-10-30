@@ -24,6 +24,9 @@ pub fn daens_fd() -> Result<OwnedFd> {
 
 /// Create the proxy namespace and retain its fd for the process lifetime.
 pub fn create_daens() -> Result<()> {
+    // A previous run may have pinned a stale netns via /run/netns. Drop it
+    // so this run operates on a fresh namespace.
+    let _ = run_cmd(&["ip", "netns", "del", NETNS_NAME]);
     let (a, b) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
