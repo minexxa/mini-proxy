@@ -19,26 +19,15 @@ jobs:
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        # Host is already aarch64-unknown-linux-gnu, no extra target needed
+
+      - name: Install nightly + rust-src (for eBPF)
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Install bpf-linker
-        uses: taiki-e/install-action@v2
-        with:
-          tool: bpf-linker
-
-      - name: Prebuild eBPF object (host)
-        run: |
-          CHANNEL=$(grep -E '^\s*channel' src/ebpf/program/rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')
-          rustup toolchain install "$CHANNEL" --profile minimal --component rust-src --component llvm-tools
-          cd src/ebpf/program
-          env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-            CARGO_TARGET_DIR="$PWD/target" \
-            cargo +"$CHANNEL" build --release -Zbuild-std=core --target bpfel-unknown-none
-          # build.rs 用这个文件判断对象是否可复用（内容必须与 channel 完全一致，无换行）
-          printf '%s' "$CHANNEL" > target/bpfel-unknown-none/release/ant-ebpf.toolchain
-          ls -l target/bpfel-unknown-none/release/ant-ebpf*
-
+          components: rust-src, llvm-tools
+          # Do NOT list bpfel-unknown-none here.
+          # That target has no prebuilt rust-std on aarch64 host;
+          # we use -Zbuild-std=core instead.
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -48,19 +37,20 @@ jobs:
             mini-ebpf
             mini-proxy
 
-      # bpf-linker must match the nightly's LLVM. On Ubuntu 24.04 arm64 the
-      # package llvm-19 (or whatever the current nightly ships) is usually
-      # enough; adjust the version if the job fails with bitcode errors.
+      # bpf-linker must match the nightly's LLVM.
+      # On Ubuntu 24.04 arm64 we install the system LLVM packages first.
       - name: Install bpf-linker dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm-dev libpolly-dev
-          # Prefer the system llvm-config that matches nightly if possible
           echo "LLVM_CONFIG_PATH=$(which llvm-config || true)" >> $GITHUB_ENV
+          llvm-config --version || true
+          rustc +nightly -vV | grep -E 'llvm|host'
 
       - name: Install bpf-linker
         run: |
-          cargo +nightly install bpf-linker --locked || \
+          # Prefer a version that can talk to current nightly LLVM
+          cargo +nightly install bpf-linker --locked 2>/dev/null || \
           cargo +nightly install bpf-linker
 
       - name: Build eBPF object
@@ -72,17 +62,16 @@ jobs:
 
       - name: Build userspace (aarch64, with ebpf)
         run: |
-          cargo +stable build --release --features ebpf \
-            --target aarch64-unknown-linux-gnu
+          cargo +stable build --release --features ebpf
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: mini-proxy-linux-aarch64
-          path: target/aarch64-unknown-linux-gnu/release/mini-proxy
+          path: target/release/mini-proxy
           if-no-files-found: error
 
-      - name: Smoke test (help / version)
+      - name: Smoke test
         run: |
-          file target/aarch64-unknown-linux-gnu/release/mini-proxy
-          target/aarch64-unknown-linux-gnu/release/mini-proxy --help || true
+          file target/release/mini-proxy
+          ./target/release/mini-proxy --help || true
