@@ -258,6 +258,17 @@ pub fn create_reply_socket(orig: SocketAddr) -> Result<tokio::net::UdpSocket> {
             anyhow::bail!("reply socket: {}", std::io::Error::last_os_error());
         }
         set_transparent(fd, family == libc::AF_INET6)?;
+        // Two concurrent flows may target the same orig dst; this socket is
+        // send-only, so reuse is safe and prevents EADDRINUSE.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &1i32 as *const _ as *const libc::c_void,
+                4,
+            )
+        };
         if unsafe { libc::bind(fd, ptr, len) } != 0 {
             anyhow::bail!("bind reply socket: {}", std::io::Error::last_os_error());
         }

@@ -140,9 +140,19 @@ pub fn setup_links(config: &Config) -> Result<()> {
     run_ip_netns(&["link", "set", DAE0_PEER, "up"])?;
     let _ = run_ip_netns(&["tc", "qdisc", "add", "dev", DAE0_PEER, "clsact"]);
 
-    // Control-plane replies leave daens via dae0peer (static neighbor makes
-    // the on-link gateway resolvable without ARP).
-    run_ip_netns(&["route", "add", "default", "via", "169.254.0.1", "dev", DAE0_PEER])?;
+    // Control-plane replies leave daens via dae0peer. Addresses are /32, so
+    // the gateway is not in any subnet: `onlink` accepts it, and the static
+    // neighbor entry below makes it resolvable without ARP.
+    run_ip_netns(&[
+        "route",
+        "add",
+        "default",
+        "via",
+        "169.254.0.1",
+        "dev",
+        DAE0_PEER,
+        "onlink",
+    ])?;
     let _ = run_ip_netns(&[
         "-6",
         "route",
@@ -152,6 +162,7 @@ pub fn setup_links(config: &Config) -> Result<()> {
         DAE0_V6_GW,
         "dev",
         DAE0_PEER,
+        "onlink",
     ]);
     run_ip_netns(&[
         "neigh",
