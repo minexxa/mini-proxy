@@ -6,12 +6,36 @@
 use crate::action::TC_ACT_UNSPEC;
 use aya_ebpf::cty::c_long;
 use aya_ebpf::programs::TcContext;
+use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
 use mini_ebpf_common::{FlowKey, IPPROTO_TCP, IPPROTO_UDP};
 
 pub const ETH_HLEN: usize = 14;
 pub const ETH_P_IP: u16 = 0x0800;
 pub const ETH_P_IPV6: u16 = 0x86dd;
 pub const ETH_P_VLAN: u16 = 0x8100;
+
+/// Bounds-checked, fixed-size load. aya's `TcContext::load_bytes` computes
+/// `min(len, skb.len - offset)` at runtime, which the verifier rejects with
+/// "invalid zero-sized read" when the range can include 0. Checking the
+/// bounds explicitly keeps the helper call at a constant size.
+#[inline(always)]
+fn load(ctx: &TcContext, off: usize, buf: &mut [u8]) -> Result<(), c_long> {
+    if (off + buf.len()) as u32 > ctx.skb.len() {
+        return Err(TC_ACT_UNSPEC);
+    }
+    let ret = unsafe {
+        bpf_skb_load_bytes(
+            ctx.skb.skb as *const _,
+            off as u32,
+            buf.as_mut_ptr() as *mut _,
+            buf.len() as u32,
+        )
+    };
+    if ret != 0 {
+        return Err(ret);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 pub struct Pkt {
@@ -46,7 +70,7 @@ impl Pkt {
 #[inline(always)]
 pub fn parse(ctx: &TcContext) -> Result<Pkt, c_long> {
     let mut eth = [0u8; ETH_HLEN];
-    if ctx.load_bytes(0, &mut eth).is_err() {
+    if load(ctx, 0, &mut eth).is_err() {
         return Err(TC_ACT_UNSPEC);
     }
     let eth_proto = ((eth[12] as u16) << 8) | eth[13] as u16;
@@ -54,7 +78,7 @@ pub fn parse(ctx: &TcContext) -> Result<Pkt, c_long> {
     let eth_proto = if eth_proto == ETH_P_VLAN {
         // Single 802.1Q tag: 4 bytes, then the real ethertype.
         let mut t = [0u8; 4];
-        if ctx.load_bytes(l3_off, &mut t).is_err() {
+        if load(ctx, l3_off, &mut t).is_err() {
             return Err(TC_ACT_UNSPEC);
         }
         l3_off += 4;
@@ -73,7 +97,7 @@ pub fn parse(ctx: &TcContext) -> Result<Pkt, c_long> {
 #[inline(always)]
 fn parse_ipv4(ctx: &TcContext, l3_off: usize, eth: &[u8; 14]) -> Result<Pkt, c_long> {
     let mut ihl_buf = [0u8; 20];
-    if ctx.load_bytes(l3_off, &mut ihl_buf).is_err() {
+    if load(ctx, l3_off, &mut ihl_buf).is_err() {
         return Err(TC_ACT_UNSPEC);
     }
     let ihl = (ihl_buf[0] & 0x0f) as usize * 4;
@@ -88,7 +112,7 @@ fn parse_ipv4(ctx: &TcContext, l3_off: usize, eth: &[u8; 14]) -> Result<Pkt, c_l
     let frag_off = (((ihl_buf[6] as u16) << 8) | ihl_buf[7] as u16) & 0x1fff;
     // 16 bytes covers ports (0..4) and the flags byte at offset 13.
     let mut l4 = [0u8; 16];
-    if ctx.load_bytes(l3_off + ihl, &mut l4).is_err() {
+    if load(ctx, l3_off + ihl, &mut l4).is_err() {
         return Err(TC_ACT_UNSPEC);
     }
     let is_fragment = frag_off != 0;
@@ -108,7 +132,7 @@ fn parse_ipv4(ctx: &TcContext, l3_off: usize, eth: &[u8; 14]) -> Result<Pkt, c_l
 fn parse_ipv6(ctx: &TcContext, l3_off: usize, eth: &[u8; 14]) -> Result<Pkt, c_long> {
     // Fixed 40-byte base header; no extension headers.
     let mut hdr = [0u8; 40];
-    if ctx.load_bytes(l3_off, &mut hdr).is_err() {
+    if load(ctx, l3_off, &mut hdr).is_err() {
         return Err(TC_ACT_UNSPEC);
     }
     let l4_proto = hdr[6];
@@ -120,7 +144,7 @@ fn parse_ipv6(ctx: &TcContext, l3_off: usize, eth: &[u8; 14]) -> Result<Pkt, c_l
     src_ip.copy_from_slice(&hdr[8..24]);
     dst_ip.copy_from_slice(&hdr[24..40]);
     let mut l4 = [0u8; 16];
-    if ctx.load_bytes(l3_off + 40, &mut l4).is_err() {
+    if load(ctx, l3_off + 40, &mut l4).is_err() {
         return Err(TC_ACT_UNSPEC);
     }
     Ok(Pkt {
