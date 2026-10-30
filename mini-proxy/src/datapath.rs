@@ -176,12 +176,21 @@ pub fn setup_links(config: &Config) -> Result<()> {
         "permanent",
     ])?;
 
-    // Marked packets deliver to local transparent sockets.
+    // Marked packets deliver to local transparent sockets. A "local default"
+    // route must sit on a device — use lo, which is up at this point.
     let mark = tproxy_mark(config);
     run_ip_netns(&["rule", "add", "fwmark", &format!("{mark:#x}"), "table", "100"])?;
-    run_ip_netns(&["route", "add", "local", "default", "table", "100"])?;
-    let _ = run_ip_netns(&["-6", "rule", "add", "fwmark", &format!("{mark:#x}"), "table", "100"]);
-    let _ = run_ip_netns(&["-6", "route", "add", "local", "default", "table", "100"]);
+    run_ip_netns(&["route", "add", "local", "default", "dev", "lo", "table", "100"])?;
+    let _ = run_ip_netns(&[
+        "-6",
+        "rule",
+        "add",
+        "fwmark",
+        &format!("{mark:#x}"),
+        "table",
+        "100",
+    ]);
+    let _ = run_ip_netns(&["-6", "route", "add", "local", "default", "dev", "lo", "table", "100"]);
     Ok(())
 }
 
