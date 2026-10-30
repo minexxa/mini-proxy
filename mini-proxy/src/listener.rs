@@ -13,31 +13,28 @@ pub const IPV6_RECVORIGDSTADDR: i32 = 74;
 
 pub struct Listeners {
     pub tcp4: tokio::net::TcpListener,
-    pub udp4: tokio::net::UdpSocket,
+    /// Blocking socket: consumed by a dedicated recv thread (see relay).
+    pub udp4: std::net::UdpSocket,
     #[allow(dead_code)]
     pub tcp6: Option<tokio::net::TcpListener>,
     #[allow(dead_code)]
-    pub udp6: Option<tokio::net::UdpSocket>,
+    pub udp6: Option<std::net::UdpSocket>,
 }
 
 /// Create transparent listeners inside `daens` and register their fds in the
 /// sockmap. Returns the tokio handles for the control plane.
 pub fn create(dp: &mut crate::datapath::Datapath, has_v6: bool) -> Result<Listeners> {
-    let (tcp4_fd, udp4_fd) = with_daens(|| {
-        Ok((tcp_listen4()?, udp_listen4()?))
-    })?;
+    let (tcp4_fd, udp4_fd) = with_daens(|| Ok((tcp_listen4()?, udp_listen4()?)))?;
     let (tcp6_fd, udp6_fd) = if has_v6 {
         with_daens(|| Ok((Some(tcp_listen6()?), Some(udp_listen6()?))))?
     } else {
         (None, None)
     };
 
-    // Non-blocking for tokio.
-    for fd in std::iter::once(tcp4_fd)
-        .chain(std::iter::once(udp4_fd))
-        .chain(tcp6_fd.iter().map(|f| f.as_raw_fd()))
-        .chain(udp6_fd.iter().map(|f| f.as_raw_fd()))
-    {
+    // TCP fds go to tokio and must be non-blocking. UDP fds stay blocking:
+    // they are read by a dedicated thread (recvmsg with RECVORIGDSTADDR has
+    // no tokio equivalent).
+    for fd in std::iter::once(tcp4_fd).chain(tcp6_fd.iter().map(|f| f.as_raw_fd())) {
         unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
     }
 
@@ -51,13 +48,13 @@ pub fn create(dp: &mut crate::datapath::Datapath, has_v6: bool) -> Result<Listen
     }
 
     let tcp4 = tokio::net::TcpListener::from_std(from_raw_tcp(tcp4_fd))?;
-    let udp4 = tokio::net::UdpSocket::from_std(from_raw_udp(udp4_fd))?;
+    let udp4 = from_raw_udp(udp4_fd);
     let tcp6 = match tcp6_fd {
         Some(fd) => Some(tokio::net::TcpListener::from_std(from_raw_tcp(fd))?),
         None => None,
     };
     let udp6 = match udp6_fd {
-        Some(fd) => Some(tokio::net::UdpSocket::from_std(from_raw_udp(fd))?),
+        Some(fd) => Some(from_raw_udp(fd)),
         None => None,
     };
     Ok(Listeners {
@@ -96,7 +93,15 @@ fn tcp_listen4() -> Result<std::os::fd::RawFd> {
         anyhow::bail!("socket: {}", std::io::Error::last_os_error());
     }
     set_transparent(fd, false)?;
-    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32 as *const _ as *const libc::c_void, 4) };
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &1i32 as *const _ as *const libc::c_void,
+            4,
+        )
+    };
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: 0,
@@ -104,7 +109,11 @@ fn tcp_listen4() -> Result<std::os::fd::RawFd> {
         sin_zero: [0; 8],
     };
     let rc = unsafe {
-        libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as u32)
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        )
     };
     if rc != 0 {
         anyhow::bail!("bind tcp4: {}", std::io::Error::last_os_error());
@@ -122,9 +131,23 @@ fn tcp_listen6() -> Result<std::os::fd::RawFd> {
     }
     set_transparent(fd, true)?;
     unsafe {
-        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &1i32 as *const _ as *const libc::c_void, 4)
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &1i32 as *const _ as *const libc::c_void,
+            4,
+        )
     };
-    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32 as *const _ as *const libc::c_void, 4) };
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &1i32 as *const _ as *const libc::c_void,
+            4,
+        )
+    };
     let addr = libc::sockaddr_in6 {
         sin6_family: libc::AF_INET6 as libc::sa_family_t,
         sin6_port: 0,
@@ -133,7 +156,11 @@ fn tcp_listen6() -> Result<std::os::fd::RawFd> {
         sin6_scope_id: 0,
     };
     let rc = unsafe {
-        libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32)
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as u32,
+        )
     };
     if rc != 0 {
         anyhow::bail!("bind tcp6: {}", std::io::Error::last_os_error());
@@ -167,7 +194,11 @@ fn udp_listen4() -> Result<std::os::fd::RawFd> {
         sin_zero: [0; 8],
     };
     let rc = unsafe {
-        libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as u32)
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        )
     };
     if rc != 0 {
         anyhow::bail!("bind udp4: {}", std::io::Error::last_os_error());
@@ -199,7 +230,11 @@ fn udp_listen6() -> Result<std::os::fd::RawFd> {
         sin6_scope_id: 0,
     };
     let rc = unsafe {
-        libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32)
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as u32,
+        )
     };
     if rc != 0 {
         anyhow::bail!("bind udp6: {}", std::io::Error::last_os_error());
@@ -283,7 +318,9 @@ fn sockaddr6_from(a: &std::net::SocketAddrV6) -> libc::sockaddr_in6 {
         sin6_family: libc::AF_INET6 as libc::sa_family_t,
         sin6_port: a.port().to_be(),
         sin6_flowinfo: a.flowinfo(),
-        sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+        sin6_addr: libc::in6_addr {
+            s6_addr: a.ip().octets(),
+        },
         sin6_scope_id: a.scope_id(),
     }
 }

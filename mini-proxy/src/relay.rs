@@ -63,24 +63,49 @@ struct UdpFlow {
 }
 
 pub async fn run_udp(
-    listener: tokio::net::UdpSocket,
+    sock: std::net::UdpSocket,
     socks: Arc<Socks5Client>,
     dns: Arc<crate::dns::DnsEngine>,
     maps: Arc<Mutex<crate::rules::StaticMaps>>,
 ) -> Result<()> {
+    // Dedicated blocking recv thread: the transparent socket is read with
+    // recvmsg(RECVORIGDSTADDR), which has no tokio equivalent. Datagrams are
+    // forwarded to the async dispatcher over a channel.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UdpEvent>();
+    std::thread::Builder::new().name("udp-recv".into()).spawn({
+        use std::os::fd::AsRawFd;
+        move || loop {
+            let mut buf = vec![0u8; 65535];
+            match unsafe { recv_orig_dst_blocking(sock.as_raw_fd(), &mut buf) } {
+                Ok((n, client, orig)) => {
+                    let payload = buf[..n].to_vec();
+                    if tx
+                        .send(UdpEvent {
+                            payload,
+                            client,
+                            orig,
+                        })
+                        .is_err()
+                    {
+                        break; // dispatcher gone: shut down
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "udp recvmsg");
+                }
+            }
+        }
+    })?;
+
     let flows: Arc<Mutex<HashMap<(SocketAddr, SocketAddr), Arc<UdpFlow>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    loop {
-        let buf = vec![0u8; 65535];
-        let (buf, n, client, orig) = match recv_orig_dst(&listener, buf).await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!(error = %e, "udp recvmsg");
-                continue;
-            }
-        };
-        let payload = buf[..n].to_vec();
+    while let Some(ev) = rx.recv().await {
+        let UdpEvent {
+            payload,
+            client,
+            orig,
+        } = ev;
         let key = (client, orig);
 
         if orig.port() == 53 {
@@ -130,6 +155,7 @@ pub async fn run_udp(
             tracing::warn!(error = %e, "udp upstream send");
         }
     }
+    Ok(())
 }
 
 async fn create_udp_flow(
@@ -207,70 +233,70 @@ fn parse_udp_header(msg: &[u8]) -> Result<(&[u8], SocketAddr)> {
     Ok((&msg[hdr_len..], addr))
 }
 
-/// recvmsg wrapper extracting IP_RECVORIGDSTADDR ancillary data. The buffer
-/// is round-tripped through the blocking pool so the async caller stays
-/// borrow-free.
-async fn recv_orig_dst(
-    sock: &UdpSocket,
-    buf: Vec<u8>,
-) -> Result<(Vec<u8>, usize, SocketAddr, SocketAddr)> {
-    use std::os::fd::AsRawFd;
-    let fd = sock.as_raw_fd();
-    tokio::task::spawn_blocking(move || unsafe { recv_orig_dst_blocking(fd, buf) }).await?
+struct UdpEvent {
+    payload: Vec<u8>,
+    client: SocketAddr,
+    orig: SocketAddr,
 }
 
+/// recvmsg wrapper extracting IP_RECVORIGDSTADDR ancillary data. Runs on the
+/// dedicated blocking recv thread; `fd` must be a blocking socket.
 unsafe fn recv_orig_dst_blocking(
     fd: std::os::fd::RawFd,
-    mut buf: Vec<u8>,
-) -> Result<(Vec<u8>, usize, SocketAddr, SocketAddr)> {
-    // SAFETY: single-threaded FFI on the blocking pool; buffers outlive the call.
+    buf: &mut [u8],
+) -> Result<(usize, SocketAddr, SocketAddr)> {
+    // SAFETY: single-threaded FFI on the recv thread; buffers outlive the call.
     unsafe {
-    let mut iovec = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let mut cmsg_buf = [0u8; 128];
-    let mut from: libc::sockaddr_storage = std::mem::zeroed();
-    let mut msg: libc::msghdr = std::mem::zeroed();
-    msg.msg_iov = &mut iovec;
-    msg.msg_iovlen = 1;
-    msg.msg_name = &mut from as *mut _ as *mut libc::c_void;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+        let mut iovec = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let mut cmsg_buf = [0u8; 128];
+        let mut from: libc::sockaddr_storage = std::mem::zeroed();
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_name = &mut from as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_buf.len();
 
-    let n = loop {
-        let rc = libc::recvmsg(fd, &mut msg, 0);
-        if rc >= 0 {
-            break rc as usize;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        anyhow::bail!("recvmsg: {err}");
-    };
+        let n = loop {
+            let rc = libc::recvmsg(fd, &mut msg, 0);
+            if rc >= 0 {
+                break rc as usize;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted
+                || err.kind() == std::io::ErrorKind::WouldBlock
+            {
+                continue;
+            }
+            anyhow::bail!("recvmsg: {err}");
+        };
 
-    let client = sockaddr_to_addr(&from).context("client addr")?;
-    let mut orig = None;
-    let mut cpos = cmsg_buf.as_mut_ptr();
-    let end = cmsg_buf.as_mut_ptr().add(cmsg_buf.len() - msg.msg_controllen as usize);
-    while cpos < end {
-        let ch = cpos as *const libc::cmsghdr;
-        let level = (*ch).cmsg_level;
-        let ctype = (*ch).cmsg_type;
-        if (level == libc::IPPROTO_IP && ctype == libc::IP_RECVORIGDSTADDR)
-            || (level == libc::IPPROTO_IPV6 && ctype == libc::IPV6_RECVORIGDSTADDR)
-        {
-            let data = cpos.add(std::mem::size_of::<libc::cmsghdr>())
-                as *const libc::sockaddr_storage;
-            orig = sockaddr_to_addr(&*data);
-            break;
+        let client = sockaddr_to_addr(&from).context("client addr")?;
+        let mut orig = None;
+        let mut cpos = cmsg_buf.as_mut_ptr();
+        let end = cmsg_buf
+            .as_mut_ptr()
+            .add(cmsg_buf.len() - msg.msg_controllen as usize);
+        while cpos < end {
+            let ch = cpos as *const libc::cmsghdr;
+            let level = (*ch).cmsg_level;
+            let ctype = (*ch).cmsg_type;
+            if (level == libc::IPPROTO_IP && ctype == libc::IP_RECVORIGDSTADDR)
+                || (level == libc::IPPROTO_IPV6 && ctype == libc::IPV6_RECVORIGDSTADDR)
+            {
+                let data =
+                    cpos.add(std::mem::size_of::<libc::cmsghdr>()) as *const libc::sockaddr_storage;
+                orig = sockaddr_to_addr(&*data);
+                break;
+            }
+            cpos = cpos.add(cmsg_align((*ch).cmsg_len as usize));
         }
-        cpos = cpos.add(cmsg_align((*ch).cmsg_len as usize));
-    }
-    let orig = orig.context("no orig dst ancillary")?;
-    Ok((buf, n, client, orig))
+        let orig = orig.context("no orig dst ancillary")?;
+        Ok((n, client, orig))
     }
 }
 
