@@ -1,0 +1,63 @@
+# mini-proxy configuration (TOML)
+# Copy to /etc/mini-proxy/config.toml or pass --config <path>.
+
+[general]
+# LAN capture interface (gateway mode), e.g. your bridge or LAN NIC.
+# Omit to run host-only mode (no LAN capture).
+# "auto" resolves to the default-route device.
+lan_interface = "auto"
+
+# WAN capture interface (host mode): captures locally-originated egress.
+# Omit to disable host-originated capture.
+wan_interface = "auto"
+
+# Skb mark steering traffic into the proxy namespace. Change only if it
+# collides with something else on the box.
+# tproxy_mark = 0x2027
+
+# Verdict when no rule matches: "direct" | "proxy" | "block".
+default_verdict = "proxy"
+
+[socks5]
+# Upstream SOCKS5 server that receives all proxied flows.
+server = "127.0.0.1:1080"
+# Optional username/password auth (RFC 1929).
+username = ""
+password = ""
+
+[dns]
+# Upstream resolver queried directly (bypasses the datapath via the
+# control-plane mark). UDP only.
+upstream = "223.5.5.5:53"
+
+# Ordered rule list; first matching surface wins.
+#   kind = "cidr"   value = "10.0.0.0/8"      verdict = direct|proxy|block
+#   kind = "port"   value = "443"             verdict = direct|proxy|block
+#   kind = "domain" value = "example.com"     verdict = direct|proxy|block
+# Domain rules are suffix matches (labels); "cn" matches any *.cn. The
+# verdict is applied to every IP the domain resolves to, so domain routing
+# works for the subsequent data packets without eBPF ever parsing DNS.
+[[rules]]
+kind = "cidr"
+value = "10.0.0.0/8"
+verdict = "direct"
+
+[[rules]]
+kind = "cidr"
+value = "192.168.0.0/16"
+verdict = "direct"
+
+[[rules]]
+kind = "domain"
+value = "cn"
+verdict = "direct"
+
+[[rules]]
+kind = "domain"
+value = "google.com"
+verdict = "proxy"
+
+[[rules]]
+kind = "port"
+value = "25"
+verdict = "block"

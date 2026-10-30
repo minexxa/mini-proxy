@@ -1,0 +1,76 @@
+name: Build Linux arm64
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-aarch64:
+    name: mini-proxy (linux/aarch64)
+    runs-on: ubuntu-24.04-arm   # native arm64 runner – no cross needed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install nightly + rust-src (for eBPF)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+          targets: bpfel-unknown-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            mini-ebpf
+            mini-proxy
+
+      # bpf-linker must match the nightly's LLVM. On Ubuntu 24.04 arm64 the
+      # package llvm-19 (or whatever the current nightly ships) is usually
+      # enough; adjust the version if the job fails with bitcode errors.
+      - name: Install bpf-linker dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm-dev libpolly-dev
+          # Prefer the system llvm-config that matches nightly if possible
+          echo "LLVM_CONFIG_PATH=$(which llvm-config || true)" >> $GITHUB_ENV
+
+      - name: Install bpf-linker
+        run: |
+          cargo +nightly install bpf-linker --locked || \
+          cargo +nightly install bpf-linker
+
+      - name: Build eBPF object
+        working-directory: mini-ebpf
+        run: |
+          cargo +nightly build --release \
+            -Zbuild-std=core \
+            --target bpfel-unknown-none
+
+      - name: Build userspace (aarch64, with ebpf)
+        run: |
+          cargo +stable build --release --features ebpf \
+            --target aarch64-unknown-linux-gnu
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-proxy-linux-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/mini-proxy
+          if-no-files-found: error
+
+      - name: Smoke test (help / version)
+        run: |
+          file target/aarch64-unknown-linux-gnu/release/mini-proxy
+          target/aarch64-unknown-linux-gnu/release/mini-proxy --help || true
