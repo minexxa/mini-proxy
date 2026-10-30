@@ -40,11 +40,13 @@ pub fn create_daens() -> Result<()> {
         }
         let ns_path = std::path::Path::new("/proc/thread-self/ns/net");
         let fd = std::fs::File::open(ns_path).context("open thread-self ns/net")?;
-        // Send the fd over SCM_RIGHTS so the main thread can pin it.
+        // Send the fd over SCM_RIGHTS. A payload byte is required: a
+        // zero-length send on a stream socket is a no-op and the fd
+        // would never be delivered.
         let fd = fd.as_raw_fd();
         sendmsg::<UnixAddr>(
             b.as_raw_fd(),
-            &[],
+            &[std::io::IoSlice::new(&[1u8])],
             &[ControlMessage::ScmRights(&[fd])],
             MsgFlags::empty(),
             None,
