@@ -3,13 +3,13 @@
 //! interesting parts (programs, maps, listeners) are all in-process.
 
 use crate::config::Config;
-use crate::ns::{run_cmd, run_ip_netns, with_daens, NETNS_NAME};
+use crate::ns::{NETNS_NAME, run_cmd, run_ip_netns, with_daens};
 use crate::rules::StaticMaps;
+use anyhow::{Context, Result};
 use aya::maps::lpm_trie::LpmTrie;
 use aya::maps::{HashMap, MapData, SockMap};
 use aya::programs::{SchedClassifier, SkLookup, TcAttachType};
-use anyhow::{Context, Result};
-use mini_ebpf_common::{Param, CONTROL_MARK, TPROXY_MARK};
+use mini_ebpf_common::{CONTROL_MARK, Param, TPROXY_MARK};
 use std::os::fd::{AsFd, AsRawFd};
 
 #[cfg(feature = "ebpf")]
@@ -104,11 +104,7 @@ pub fn setup_links(config: &Config) -> Result<()> {
     let _ = run_cmd(&["sysctl", "-w", "net.ipv4.ip_forward=1"]);
     let _ = run_cmd(&["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"]);
     for ifc in ["all", "default"] {
-        let _ = run_cmd(&[
-            "sysctl",
-            "-w",
-            &format!("net.ipv4.conf.{ifc}.rp_filter=0"),
-        ]);
+        let _ = run_cmd(&["sysctl", "-w", &format!("net.ipv4.conf.{ifc}.rp_filter=0")]);
     }
     for ifc in [config.general.lan_interface.as_deref().unwrap_or("all")] {
         let _ = run_cmd(&["sysctl", "-w", &format!("net.ipv4.conf.{ifc}.rp_filter=0")]);
@@ -158,15 +154,7 @@ pub fn setup_links(config: &Config) -> Result<()> {
         "onlink",
     ])?;
     let _ = run_ip_netns(&[
-        "-6",
-        "route",
-        "replace",
-        "default",
-        "via",
-        DAE0_V6_GW,
-        "dev",
-        DAE0_PEER,
-        "onlink",
+        "-6", "route", "replace", "default", "via", DAE0_V6_GW, "dev", DAE0_PEER, "onlink",
     ]);
     run_ip_netns(&[
         "neigh",
@@ -184,19 +172,34 @@ pub fn setup_links(config: &Config) -> Result<()> {
     // route must sit on a device — use lo, which is up at this point.
     // `replace` keeps restarts against a stale netns idempotent.
     let mark = tproxy_mark(config);
-    let _ = run_ip_netns(&["rule", "del", "fwmark", &format!("{mark:#x}"), "table", "100"]);
-    run_ip_netns(&["rule", "add", "fwmark", &format!("{mark:#x}"), "table", "100"])?;
+    let _ = run_ip_netns(&[
+        "rule",
+        "del",
+        "fwmark",
+        &format!("{mark:#x}"),
+        "table",
+        "100",
+    ]);
     run_ip_netns(&[
-        "route",
-        "replace",
-        "local",
-        "default",
-        "dev",
-        "lo",
+        "rule",
+        "add",
+        "fwmark",
+        &format!("{mark:#x}"),
         "table",
         "100",
     ])?;
-    let _ = run_ip_netns(&["-6", "rule", "del", "fwmark", &format!("{mark:#x}"), "table", "100"]);
+    run_ip_netns(&[
+        "route", "replace", "local", "default", "dev", "lo", "table", "100",
+    ])?;
+    let _ = run_ip_netns(&[
+        "-6",
+        "rule",
+        "del",
+        "fwmark",
+        &format!("{mark:#x}"),
+        "table",
+        "100",
+    ]);
     let _ = run_ip_netns(&[
         "-6",
         "rule",
@@ -207,15 +210,7 @@ pub fn setup_links(config: &Config) -> Result<()> {
         "100",
     ]);
     let _ = run_ip_netns(&[
-        "-6",
-        "route",
-        "replace",
-        "local",
-        "default",
-        "dev",
-        "lo",
-        "table",
-        "100",
+        "-6", "route", "replace", "local", "default", "dev", "lo", "table", "100",
     ]);
     Ok(())
 }
@@ -258,9 +253,28 @@ pub fn load_and_attach(
     wan: Option<(String, u32)>,
 ) -> Result<Datapath> {
     let dae0 = unsafe { libc::if_nametoindex(std::ffi::CString::new(DAE0_HOST)?.as_ptr()) };
+
+    // Local mode: when the LAN capture interface is the same device as the
+    // WAN capture interface, attaching lan_ingress to it would intercept
+    // every inbound packet destined to the host itself — including all
+    // reply traffic (DNS upstream, outbound control, direct connections) —
+    // and re-hijack it whenever the default verdict is "proxy". Host
+    // originated flows are steered by wan_egress alone; replies arrive on
+    // ingress unhooked and the local stack delivers them.
+    let lan_attach = match (&lan, &wan) {
+        (Some((lan_name, lan_idx)), Some((_, wan_idx))) if lan_idx == wan_idx => {
+            tracing::info!(
+                iface = %lan_name,
+                "local mode: lan_ingress skipped (same interface as wan)"
+            );
+            None
+        }
+        _ => lan.clone(),
+    };
+
     let param = Param {
         dae0_ifindex: dae0,
-        lan_ifindex: lan.as_ref().map(|(_, i)| *i).unwrap_or(0),
+        lan_ifindex: lan_attach.as_ref().map(|(_, i)| *i).unwrap_or(0),
         wan_ifindex: wan.as_ref().map(|(_, i)| *i).unwrap_or(0),
         default_verdict: crate::rules::Verdict::parse(&config.general.default_verdict)?.to_u8(),
         dns_hijack: 1,
@@ -277,7 +291,12 @@ pub fn load_and_attach(
         ))
         .context("load mini-ebpf object (build mini-ebpf first)")?;
 
-    for prog in ["lan_ingress", "wan_egress", "dae0_ingress", "dae0peer_ingress"] {
+    for prog in [
+        "lan_ingress",
+        "wan_egress",
+        "dae0_ingress",
+        "dae0peer_ingress",
+    ] {
         let p: &mut SchedClassifier = ebpf
             .program_mut(prog)
             .context("program missing")?
@@ -292,7 +311,7 @@ pub fn load_and_attach(
 
     // Host-side hooks. TCX rejects already-attached names across restarts of
     // the same pinned name, but a fresh process gets fresh links.
-    if let Some((lan_name, _)) = &lan {
+    if let Some((lan_name, _)) = &lan_attach {
         let p: &mut SchedClassifier = ebpf.program_mut("lan_ingress").unwrap().try_into()?;
         p.attach(lan_name, TcAttachType::Ingress)
             .context("attach lan_ingress")?;
@@ -308,13 +327,13 @@ pub fn load_and_attach(
 
     // Proxy-namespace hooks must be attached from inside daens.
     with_daens(|| {
-        let p: &mut SchedClassifier =
-            ebpf.program_mut("dae0peer_ingress").unwrap().try_into()?;
+        let p: &mut SchedClassifier = ebpf.program_mut("dae0peer_ingress").unwrap().try_into()?;
         p.attach(DAE0_PEER, TcAttachType::Ingress)
             .context("attach dae0peer_ingress")?;
         let s: &mut SkLookup = ebpf.program_mut("tproxy_sk_lookup").unwrap().try_into()?;
         let netns = crate::ns::daens_fd()?;
-        s.attach(&netns).context("attach tproxy_sk_lookup (daens)")?;
+        s.attach(&netns)
+            .context("attach tproxy_sk_lookup (daens)")?;
         Ok(())
     })?;
 
@@ -327,7 +346,6 @@ pub fn load_and_attach(
     let listen_sockets = SockMap::try_from(take_map(&mut ebpf, "LISTEN_SOCKETS")?)?;
     let sk_storage = map_data(take_map(&mut ebpf, "SK_IDENTITY")?);
     let sk_storage_fd = sk_storage.fd().as_fd().as_raw_fd();
-
 
     Ok(Datapath {
         maps: Some(maps),
