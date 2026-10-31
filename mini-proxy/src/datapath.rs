@@ -36,6 +36,9 @@ pub struct Datapath {
     pub maps: Option<StaticMaps>,
     pub listen_sockets: SockMap<MapData>,
     pub sk_storage_fd: std::os::fd::RawFd,
+    /// Owns SK_IDENTITY; dropping it would close `sk_storage_fd`.
+    #[allow(dead_code)]
+    _sk_storage: MapData,
     /// Keep the loader alive: detached programs pin their links.
     #[allow(dead_code)]
     _ebpf: aya::Ebpf,
@@ -322,16 +325,15 @@ pub fn load_and_attach(
         cidr_v6: LpmTrie::try_from(take_map(&mut ebpf, "CIDR_V6")?)?,
     };
     let listen_sockets = SockMap::try_from(take_map(&mut ebpf, "LISTEN_SOCKETS")?)?;
-    let sk_storage_fd = map_data(take_map(&mut ebpf, "SK_IDENTITY")?)
-        .fd()
-        .as_fd()
-        .as_raw_fd();
+    let sk_storage = map_data(take_map(&mut ebpf, "SK_IDENTITY")?);
+    let sk_storage_fd = sk_storage.fd().as_fd().as_raw_fd();
 
 
     Ok(Datapath {
         maps: Some(maps),
         listen_sockets,
         sk_storage_fd,
+        _sk_storage: sk_storage,
         _ebpf: ebpf,
     })
 }
